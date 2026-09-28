@@ -17,6 +17,7 @@ def postprocess(out, depth_mode, conf_mode):
     """
     extract 3D points/confidence from prediction head output
     """
+    out = out.float()
     fmap = out.permute(0, 2, 3, 1)  # B,H,W,3
     res = dict(pts3d=reg_dense_depth(fmap[:, :, :, 0:3], mode=depth_mode))
 

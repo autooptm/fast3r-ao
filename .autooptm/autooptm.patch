@@ -1,0 +1,314 @@
+diff --git a/fast3r/croco/models/blocks.py b/fast3r/croco/models/blocks.py
+index f41f92bf25fb33a3daf85fac1268276e6c506645..6314ded51efeba9bb75491d0b39cec66a275e62a 100644
+--- a/fast3r/croco/models/blocks.py
++++ b/fast3r/croco/models/blocks.py
+@@ -144,7 +144,11 @@ class Attention(nn.Module):
+         # q,k,v = qkv.unbind(2)  # make torchscript happy (cannot use tensor as tuple)
+ 
+         if self.rope is not None:
+-            with torch.autocast(device_type=next(self.parameters()).device.type, dtype=torch.float32):  # FIXME: for some reason Lightning didn't pick up torch.cuda.amp.custom_fwd when using bf16-true
++            if q.dtype == torch.float32:
++                with torch.autocast(device_type=q.device.type, dtype=torch.float32):  # FIXME: for some reason Lightning didn't pick up torch.cuda.amp.custom_fwd when using bf16-true
++                    q = self.rope(q, xpos) if xpos is not None else q
++                    k = self.rope(k, xpos) if xpos is not None else k
++            else:
+                 q = self.rope(q, xpos) if xpos is not None else q
+                 k = self.rope(k, xpos) if xpos is not None else k
+ 
+@@ -171,10 +175,12 @@ class Attention(nn.Module):
+         elif self.attn_implementation == "flash_attention":
+             with torch.nn.attention.sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+                 dtype = k.dtype
+-                with torch.autocast("cuda", dtype=torch.bfloat16):
++                if dtype == torch.float32:
++                    with torch.autocast("cuda", dtype=torch.bfloat16):
++                        x = scaled_dot_product_attention(q, k, v, attn_mask=self.attn_mask, dropout_p=self.dropout_p, is_causal=self.is_causal, scale=scale)
++                    x = x.to(torch.float32)  # if input was FP32, cast back to FP32
++                else:
+                     x = scaled_dot_product_attention(q, k, v, attn_mask=self.attn_mask, dropout_p=self.dropout_p, is_causal=self.is_causal, scale=scale)
+-                if dtype == torch.float32:  # if input was FP32, cast back to FP32
+-                    x = x.to(torch.float32)
+                 x = x.transpose(1, 2).reshape(B, N, C)
+                 x = self.proj(x)
+                 x = self.proj_drop(x)
+diff --git a/fast3r/croco/models/pos_embed.py b/fast3r/croco/models/pos_embed.py
+index aa307829fa0cb707549ae22901719d6eee349591..96b88a7f92870676abaa27720bc48e752aedcdec 100644
+--- a/fast3r/croco/models/pos_embed.py
++++ b/fast3r/croco/models/pos_embed.py
+@@ -128,6 +128,8 @@ except ImportError:
+         "Warning, cannot find cuda-compiled version of RoPE2D, using a slow pytorch version instead"
+     )
+ 
++    ROPE_MAX_POSITIONS = 4096
++
+     class RoPE2D(torch.nn.Module):
+         def __init__(self, freq=100.0, F0=1.0):
+             super().__init__()
+@@ -173,7 +175,7 @@ except ImportError:
+             D = tokens.size(3) // 2
+             assert positions.ndim == 3 and positions.shape[-1] == 2  # Batch, Seq, 2
+             cos, sin = self.get_cos_sin(
+-                D, int(positions.max()) + 1, tokens.device, tokens.dtype
++                D, ROPE_MAX_POSITIONS, tokens.device, tokens.dtype
+             )
+             # split features into two along the feature dimension, and apply rope1d on each half
+             y, x = tokens.chunk(2, dim=-1)
+diff --git a/fast3r/dust3r/heads/postprocess.py b/fast3r/dust3r/heads/postprocess.py
+index 2d1fbfe5e22b41974260b4af210ea9d73c506955..b80289b932f600d27352f5d37234499f7c78383c 100644
+--- a/fast3r/dust3r/heads/postprocess.py
++++ b/fast3r/dust3r/heads/postprocess.py
+@@ -17,6 +17,7 @@ def postprocess(out, depth_mode, conf_mode):
+     """
+     extract 3D points/confidence from prediction head output
+     """
++    out = out.float()
+     fmap = out.permute(0, 2, 3, 1)  # B,H,W,3
+     res = dict(pts3d=reg_dense_depth(fmap[:, :, :, 0:3], mode=depth_mode))
+ 
+diff --git a/fast3r/dust3r/inference_multiview.py b/fast3r/dust3r/inference_multiview.py
+index f9fcce51e4e38b372bf0262014265e09924e277e..f4401d3b69a71732c137ceaa559452b4492c0a7e 100644
+--- a/fast3r/dust3r/inference_multiview.py
++++ b/fast3r/dust3r/inference_multiview.py
+@@ -47,7 +47,14 @@ def loss_of_one_batch(
+         autocast_dict["dtype"] = torch.bfloat16
+     elif precision == torch.bfloat16:
+         autocast_dict["dtype"] = torch.bfloat16
+-    
++
++    weight_dtype = getattr(model, "_fast3r_opt_state", None)
++    if weight_dtype is not None:
++        autocast_dict = dict(device_type=device.type, enabled=False)
++        for view in views:
++            if "img" in view:
++                view["img"] = view["img"].to(weight_dtype)
++
+ 
+     with torch.autocast(**autocast_dict):
+         if profiling:
+diff --git a/fast3r/dust3r/utils/image.py b/fast3r/dust3r/utils/image.py
+index 0eba3b43914ae3e6fd2018ba27b7fcbeccdf3e48..760caf91a2ab9dc0a59e41c99baeda31839fd0eb 100644
+--- a/fast3r/dust3r/utils/image.py
++++ b/fast3r/dust3r/utils/image.py
+@@ -11,6 +11,7 @@
+ # utilitary functions about images (loading/converting...)
+ # --------------------------------------------------------
+ import os
++from concurrent.futures import ThreadPoolExecutor
+ 
+ import numpy as np
+ import PIL.Image
+@@ -73,6 +74,55 @@ def _resize_pil_image(img, long_edge_size):
+     return img.resize(new_size, interp)
+ 
+ 
++def _load_one_image(root, path, size, square_ok, rotate_clockwise_90, crop_to_landscape):
++    img = exif_transpose(PIL.Image.open(os.path.join(root, path))).convert("RGB")
++    if rotate_clockwise_90:
++        img = img.rotate(-90, expand=True)
++    if crop_to_landscape:
++        # Crop to a landscape aspect ratio (e.g., 16:9)
++        desired_aspect_ratio = 4 / 3
++        width, height = img.size
++        current_aspect_ratio = width / height
++
++        if current_aspect_ratio > desired_aspect_ratio:
++            # Wider than landscape: crop width
++            new_width = int(height * desired_aspect_ratio)
++            left = (width - new_width) // 2
++            right = left + new_width
++            top = 0
++            bottom = height
++        else:
++            # Taller than landscape: crop height
++            new_height = int(width / desired_aspect_ratio)
++            top = (height - new_height) // 2
++            bottom = top + new_height
++            left = 0
++            right = width
++
++        img = img.crop((left, top, right, bottom))
++
++    W1, H1 = img.size
++    if size == 224:
++        # resize short side to 224 (then crop)
++        img = _resize_pil_image(img, round(size * max(W1 / H1, H1 / W1)))
++    else:
++        # resize long side to 512
++        img = _resize_pil_image(img, size)
++    W, H = img.size
++    cx, cy = W // 2, H // 2
++    if size == 224:
++        half = min(cx, cy)
++        img = img.crop((cx - half, cy - half, cx + half, cy + half))
++    else:
++        halfw, halfh = ((2 * cx) // 16) * 8, ((2 * cy) // 16) * 8
++        if not (square_ok) and W == H:
++            halfh = 3 * halfw / 4
++        img = img.crop((cx - halfw, cy - halfh, cx + halfw, cy + halfh))
++
++    W2, H2 = img.size
++    return ImgNorm(img)[None], np.int32([img.size[::-1]]), (W1, H1, W2, H2)
++
++
+ def load_images(folder_or_list, size, square_ok=False, verbose=True, rotate_clockwise_90=False, crop_to_landscape=False):
+     """open and convert all images in a list or folder to proper input format for DUSt3R"""
+     if isinstance(folder_or_list, str):
+@@ -93,61 +143,35 @@ def load_images(folder_or_list, size, square_ok=False, verbose=True, rotate_cloc
+         supported_images_extensions += [".heic", ".heif"]
+     supported_images_extensions = tuple(supported_images_extensions)
+ 
+-    imgs = []
+-    for path in folder_content:
+-        if not path.lower().endswith(supported_images_extensions):
+-            continue
+-        img = exif_transpose(PIL.Image.open(os.path.join(root, path))).convert("RGB")
+-        if rotate_clockwise_90:
+-            img = img.rotate(-90, expand=True)
+-        if crop_to_landscape:
+-            # Crop to a landscape aspect ratio (e.g., 16:9)
+-            desired_aspect_ratio = 4 / 3
+-            width, height = img.size
+-            current_aspect_ratio = width / height
+-
+-            if current_aspect_ratio > desired_aspect_ratio:
+-                # Wider than landscape: crop width
+-                new_width = int(height * desired_aspect_ratio)
+-                left = (width - new_width) // 2
+-                right = left + new_width
+-                top = 0
+-                bottom = height
+-            else:
+-                # Taller than landscape: crop height
+-                new_height = int(width / desired_aspect_ratio)
+-                top = (height - new_height) // 2
+-                bottom = top + new_height
+-                left = 0
+-                right = width
+-
+-            img = img.crop((left, top, right, bottom))
+-
+-        W1, H1 = img.size
+-        if size == 224:
+-            # resize short side to 224 (then crop)
+-            img = _resize_pil_image(img, round(size * max(W1 / H1, H1 / W1)))
+-        else:
+-            # resize long side to 512
+-            img = _resize_pil_image(img, size)
+-        W, H = img.size
+-        cx, cy = W // 2, H // 2
+-        if size == 224:
+-            half = min(cx, cy)
+-            img = img.crop((cx - half, cy - half, cx + half, cy + half))
+-        else:
+-            halfw, halfh = ((2 * cx) // 16) * 8, ((2 * cy) // 16) * 8
+-            if not (square_ok) and W == H:
+-                halfh = 3 * halfw / 4
+-            img = img.crop((cx - halfw, cy - halfh, cx + halfw, cy + halfh))
++    paths = [p for p in folder_content if p.lower().endswith(supported_images_extensions)]
++
++    max_workers = int(os.environ.get("FAST3R_OPT_2", "0")) or min(
++        len(paths) or 1, (os.cpu_count() or 8), 16
++    )
++    if max_workers > 1 and len(paths) > 1:
++        with ThreadPoolExecutor(max_workers=max_workers) as pool:
++            prepared = list(
++                pool.map(
++                    lambda p: _load_one_image(
++                        root, p, size, square_ok, rotate_clockwise_90, crop_to_landscape
++                    ),
++                    paths,
++                )
++            )
++    else:
++        prepared = [
++            _load_one_image(root, p, size, square_ok, rotate_clockwise_90, crop_to_landscape)
++            for p in paths
++        ]
+ 
+-        W2, H2 = img.size
++    imgs = []
++    for path, (img_tensor, true_shape, (W1, H1, W2, H2)) in zip(paths, prepared):
+         if verbose:
+             print(f" - adding {path} with resolution {W1}x{H1} --> {W2}x{H2}")
+         imgs.append(
+             dict(
+-                img=ImgNorm(img)[None],
+-                true_shape=np.int32([img.size[::-1]]),
++                img=img_tensor,
++                true_shape=true_shape,
+                 idx=len(imgs),
+                 instance=str(len(imgs)),
+             )
+diff --git a/fast3r/models/multiview_dust3r_module.py b/fast3r/models/multiview_dust3r_module.py
+index f37459b998162f963a8c4b196fef58df7269f5ef..3ba833bd708bff61ea9c2d90fb0148cc33b903e5 100644
+--- a/fast3r/models/multiview_dust3r_module.py
++++ b/fast3r/models/multiview_dust3r_module.py
+@@ -6,9 +6,11 @@
+ 
+ from typing import Any, Dict, List, Optional, Tuple
+ import numpy as np
++import os
+ import re
+ import roma
+ import torch
++import torch.nn as nn
+ from torch.distributed import all_gather_object, barrier
+ from lightning import LightningModule
+ from lightning.pytorch.loggers.wandb import WandbLogger
+@@ -64,6 +66,48 @@ def gather_deduplicated_scene_metrics(reconstruction_metrics_per_epoch):
+ 
+     return all_metrics
+ 
++_DEFAULT_OPT_3 = ""
++
++
++def _prepare_inference_weights(net: Fast3R) -> None:
++    dtype_name = os.environ.get(
++        "FAST3R_OPT_3", _DEFAULT_OPT_3).strip().lower()
++    if dtype_name in ("bf16", "bfloat16"):
++        opt_t = torch.bfloat16
++    elif dtype_name in ("fp16", "float16", "half"):
++        opt_t = torch.float16
++    elif dtype_name in ("", "32", "fp32", "float32"):
++        opt_t = None
++    else:
++        raise ValueError(
++            f"FAST3R_OPT_3={dtype_name!r} not understood; "
++            f"expected one of bf16, fp16, fp32"
++        )
++
++    if opt_t is not None:
++        net.to(opt_t)
++        net._fast3r_opt_state = opt_t
++        return
++
++    _prep_weights_1(net)
++
++
++def _prep_weights_1(net: Fast3R) -> None:
++    if os.environ.get("FAST3R_OPT_1", "1") == "0":
++        return
++    castable = (
++        nn.Linear, nn.Conv1d, nn.Conv2d, nn.Conv3d,
++        nn.ConvTranspose2d, nn.ConvTranspose3d,
++    )
++    for mod in net.modules():
++        if not isinstance(mod, castable):
++            continue
++        for name in ("weight", "bias"):
++            p = getattr(mod, name, None)
++            if p is not None and p.is_floating_point():
++                p.data = p.data.to(torch.float16)
++
++
+ class MultiViewDUSt3RLitModule(LightningModule):
+     def __init__(
+         self,
+@@ -120,6 +164,7 @@ class MultiViewDUSt3RLitModule(LightningModule):
+     def load_for_inference(cls, net: Fast3R):
+         lit_module = cls(net=net, train_criterion=None, validation_criterion=None, optimizer=None, scheduler=None, compile=False)
+         lit_module.eval()
++        _prepare_inference_weights(net)
+         return lit_module
+ 
+     def forward(self, views: List[Dict[str, torch.Tensor]]) -> Any:

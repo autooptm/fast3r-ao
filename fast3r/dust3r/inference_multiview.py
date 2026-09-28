@@ -47,7 +47,14 @@ def loss_of_one_batch(
         autocast_dict["dtype"] = torch.bfloat16
     elif precision == torch.bfloat16:
         autocast_dict["dtype"] = torch.bfloat16
-    
+
+    weight_dtype = getattr(model, "_fast3r_opt_state", None)
+    if weight_dtype is not None:
+        autocast_dict = dict(device_type=device.type, enabled=False)
+        for view in views:
+            if "img" in view:
+                view["img"] = view["img"].to(weight_dtype)
+
 
     with torch.autocast(**autocast_dict):
         if profiling:

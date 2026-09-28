@@ -128,6 +128,8 @@ except ImportError:
         "Warning, cannot find cuda-compiled version of RoPE2D, using a slow pytorch version instead"
     )
 
+    ROPE_MAX_POSITIONS = 4096
+
     class RoPE2D(torch.nn.Module):
         def __init__(self, freq=100.0, F0=1.0):
             super().__init__()
@@ -173,7 +175,7 @@ except ImportError:
             D = tokens.size(3) // 2
             assert positions.ndim == 3 and positions.shape[-1] == 2  # Batch, Seq, 2
             cos, sin = self.get_cos_sin(
-                D, int(positions.max()) + 1, tokens.device, tokens.dtype
+                D, ROPE_MAX_POSITIONS, tokens.device, tokens.dtype
             )
             # split features into two along the feature dimension, and apply rope1d on each half
             y, x = tokens.chunk(2, dim=-1)

@@ -144,7 +144,11 @@ class Attention(nn.Module):
         # q,k,v = qkv.unbind(2)  # make torchscript happy (cannot use tensor as tuple)
 
         if self.rope is not None:
-            with torch.autocast(device_type=next(self.parameters()).device.type, dtype=torch.float32):  # FIXME: for some reason Lightning didn't pick up torch.cuda.amp.custom_fwd when using bf16-true
+            if q.dtype == torch.float32:
+                with torch.autocast(device_type=q.device.type, dtype=torch.float32):  # FIXME: for some reason Lightning didn't pick up torch.cuda.amp.custom_fwd when using bf16-true
+                    q = self.rope(q, xpos) if xpos is not None else q
+                    k = self.rope(k, xpos) if xpos is not None else k
+            else:
                 q = self.rope(q, xpos) if xpos is not None else q
                 k = self.rope(k, xpos) if xpos is not None else k
 
@@ -171,10 +175,12 @@ class Attention(nn.Module):
         elif self.attn_implementation == "flash_attention":
             with torch.nn.attention.sdpa_kernel(SDPBackend.FLASH_ATTENTION):
                 dtype = k.dtype
-                with torch.autocast("cuda", dtype=torch.bfloat16):
+                if dtype == torch.float32:
+                    with torch.autocast("cuda", dtype=torch.bfloat16):
+                        x = scaled_dot_product_attention(q, k, v, attn_mask=self.attn_mask, dropout_p=self.dropout_p, is_causal=self.is_causal, scale=scale)
+                    x = x.to(torch.float32)  # if input was FP32, cast back to FP32
+                else:
                     x = scaled_dot_product_attention(q, k, v, attn_mask=self.attn_mask, dropout_p=self.dropout_p, is_causal=self.is_causal, scale=scale)
-                if dtype == torch.float32:  # if input was FP32, cast back to FP32
-                    x = x.to(torch.float32)
                 x = x.transpose(1, 2).reshape(B, N, C)
                 x = self.proj(x)
                 x = self.proj_drop(x)

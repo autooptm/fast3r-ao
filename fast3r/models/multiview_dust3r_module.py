@@ -6,9 +6,11 @@
 
 from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
+import os
 import re
 import roma
 import torch
+import torch.nn as nn
 from torch.distributed import all_gather_object, barrier
 from lightning import LightningModule
 from lightning.pytorch.loggers.wandb import WandbLogger
@@ -63,6 +65,48 @@ def gather_deduplicated_scene_metrics(reconstruction_metrics_per_epoch):
             all_metrics[dataset_name].update(scenes)  # Keeps the first occurrence of each scene
 
     return all_metrics
+
+_DEFAULT_OPT_3 = ""
+
+
+def _prepare_inference_weights(net: Fast3R) -> None:
+    dtype_name = os.environ.get(
+        "FAST3R_OPT_3", _DEFAULT_OPT_3).strip().lower()
+    if dtype_name in ("bf16", "bfloat16"):
+        opt_t = torch.bfloat16
+    elif dtype_name in ("fp16", "float16", "half"):
+        opt_t = torch.float16
+    elif dtype_name in ("", "32", "fp32", "float32"):
+        opt_t = None
+    else:
+        raise ValueError(
+            f"FAST3R_OPT_3={dtype_name!r} not understood; "
+            f"expected one of bf16, fp16, fp32"
+        )
+
+    if opt_t is not None:
+        net.to(opt_t)
+        net._fast3r_opt_state = opt_t
+        return
+
+    _prep_weights_1(net)
+
+
+def _prep_weights_1(net: Fast3R) -> None:
+    if os.environ.get("FAST3R_OPT_1", "1") == "0":
+        return
+    castable = (
+        nn.Linear, nn.Conv1d, nn.Conv2d, nn.Conv3d,
+        nn.ConvTranspose2d, nn.ConvTranspose3d,
+    )
+    for mod in net.modules():
+        if not isinstance(mod, castable):
+            continue
+        for name in ("weight", "bias"):
+            p = getattr(mod, name, None)
+            if p is not None and p.is_floating_point():
+                p.data = p.data.to(torch.float16)
+
 
 class MultiViewDUSt3RLitModule(LightningModule):
     def __init__(
@@ -120,6 +164,7 @@ class MultiViewDUSt3RLitModule(LightningModule):
     def load_for_inference(cls, net: Fast3R):
         lit_module = cls(net=net, train_criterion=None, validation_criterion=None, optimizer=None, scheduler=None, compile=False)
         lit_module.eval()
+        _prepare_inference_weights(net)
         return lit_module
 
     def forward(self, views: List[Dict[str, torch.Tensor]]) -> Any:

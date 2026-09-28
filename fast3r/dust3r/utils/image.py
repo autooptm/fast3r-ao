@@ -11,6 +11,7 @@
 # utilitary functions about images (loading/converting...)
 # --------------------------------------------------------
 import os
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import PIL.Image
@@ -73,6 +74,55 @@ def _resize_pil_image(img, long_edge_size):
     return img.resize(new_size, interp)
 
 
+def _load_one_image(root, path, size, square_ok, rotate_clockwise_90, crop_to_landscape):
+    img = exif_transpose(PIL.Image.open(os.path.join(root, path))).convert("RGB")
+    if rotate_clockwise_90:
+        img = img.rotate(-90, expand=True)
+    if crop_to_landscape:
+        # Crop to a landscape aspect ratio (e.g., 16:9)
+        desired_aspect_ratio = 4 / 3
+        width, height = img.size
+        current_aspect_ratio = width / height
+
+        if current_aspect_ratio > desired_aspect_ratio:
+            # Wider than landscape: crop width
+            new_width = int(height * desired_aspect_ratio)
+            left = (width - new_width) // 2
+            right = left + new_width
+            top = 0
+            bottom = height
+        else:
+            # Taller than landscape: crop height
+            new_height = int(width / desired_aspect_ratio)
+            top = (height - new_height) // 2
+            bottom = top + new_height
+            left = 0
+            right = width
+
+        img = img.crop((left, top, right, bottom))
+
+    W1, H1 = img.size
+    if size == 224:
+        # resize short side to 224 (then crop)
+        img = _resize_pil_image(img, round(size * max(W1 / H1, H1 / W1)))
+    else:
+        # resize long side to 512
+        img = _resize_pil_image(img, size)
+    W, H = img.size
+    cx, cy = W // 2, H // 2
+    if size == 224:
+        half = min(cx, cy)
+        img = img.crop((cx - half, cy - half, cx + half, cy + half))
+    else:
+        halfw, halfh = ((2 * cx) // 16) * 8, ((2 * cy) // 16) * 8
+        if not (square_ok) and W == H:
+            halfh = 3 * halfw / 4
+        img = img.crop((cx - halfw, cy - halfh, cx + halfw, cy + halfh))
+
+    W2, H2 = img.size
+    return ImgNorm(img)[None], np.int32([img.size[::-1]]), (W1, H1, W2, H2)
+
+
 def load_images(folder_or_list, size, square_ok=False, verbose=True, rotate_clockwise_90=False, crop_to_landscape=False):
     """open and convert all images in a list or folder to proper input format for DUSt3R"""
     if isinstance(folder_or_list, str):
@@ -93,61 +143,35 @@ def load_images(folder_or_list, size, square_ok=False, verbose=True, rotate_cloc
         supported_images_extensions += [".heic", ".heif"]
     supported_images_extensions = tuple(supported_images_extensions)
 
+    paths = [p for p in folder_content if p.lower().endswith(supported_images_extensions)]
+
+    max_workers = int(os.environ.get("FAST3R_OPT_2", "0")) or min(
+        len(paths) or 1, (os.cpu_count() or 8), 16
+    )
+    if max_workers > 1 and len(paths) > 1:
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            prepared = list(
+                pool.map(
+                    lambda p: _load_one_image(
+                        root, p, size, square_ok, rotate_clockwise_90, crop_to_landscape
+                    ),
+                    paths,
+                )
+            )
+    else:
+        prepared = [
+            _load_one_image(root, p, size, square_ok, rotate_clockwise_90, crop_to_landscape)
+            for p in paths
+        ]
+
     imgs = []
-    for path in folder_content:
-        if not path.lower().endswith(supported_images_extensions):
-            continue
-        img = exif_transpose(PIL.Image.open(os.path.join(root, path))).convert("RGB")
-        if rotate_clockwise_90:
-            img = img.rotate(-90, expand=True)
-        if crop_to_landscape:
-            # Crop to a landscape aspect ratio (e.g., 16:9)
-            desired_aspect_ratio = 4 / 3
-            width, height = img.size
-            current_aspect_ratio = width / height
-
-            if current_aspect_ratio > desired_aspect_ratio:
-                # Wider than landscape: crop width
-                new_width = int(height * desired_aspect_ratio)
-                left = (width - new_width) // 2
-                right = left + new_width
-                top = 0
-                bottom = height
-            else:
-                # Taller than landscape: crop height
-                new_height = int(width / desired_aspect_ratio)
-                top = (height - new_height) // 2
-                bottom = top + new_height
-                left = 0
-                right = width
-
-            img = img.crop((left, top, right, bottom))
-
-        W1, H1 = img.size
-        if size == 224:
-            # resize short side to 224 (then crop)
-            img = _resize_pil_image(img, round(size * max(W1 / H1, H1 / W1)))
-        else:
-            # resize long side to 512
-            img = _resize_pil_image(img, size)
-        W, H = img.size
-        cx, cy = W // 2, H // 2
-        if size == 224:
-            half = min(cx, cy)
-            img = img.crop((cx - half, cy - half, cx + half, cy + half))
-        else:
-            halfw, halfh = ((2 * cx) // 16) * 8, ((2 * cy) // 16) * 8
-            if not (square_ok) and W == H:
-                halfh = 3 * halfw / 4
-            img = img.crop((cx - halfw, cy - halfh, cx + halfw, cy + halfh))
-
-        W2, H2 = img.size
+    for path, (img_tensor, true_shape, (W1, H1, W2, H2)) in zip(paths, prepared):
         if verbose:
             print(f" - adding {path} with resolution {W1}x{H1} --> {W2}x{H2}")
         imgs.append(
             dict(
-                img=ImgNorm(img)[None],
-                true_shape=np.int32([img.size[::-1]]),
+                img=img_tensor,
+                true_shape=true_shape,
                 idx=len(imgs),
                 instance=str(len(imgs)),
             )

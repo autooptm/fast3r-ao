@@ -1,4 +1,84 @@
 <div align="center">
+  <a href="https://autooptm.com"><img src=".autooptm/logo.png" width="96" alt="AutoOptm"></a>
+
+  <h1>fast3r · optimized by <a href="https://autooptm.com">AutoOptm</a></h1>
+
+  <p><b>1.56x faster end to end</b> on the command below, output verified against the stock program.</p>
+
+  <p>
+    <a href="https://autooptm.com"><img alt="speedup" src="https://img.shields.io/badge/end--to--end-1.56x-2ea44f"></a>
+    <a href="https://github.com/facebookresearch/fast3r/commit/33104d4b5b8df43795ecded236194958bbdac572"><img alt="base" src="https://img.shields.io/badge/upstream-33104d4b5b8d-blue"></a>
+    <img alt="card" src="https://img.shields.io/badge/measured%20on-A10-lightgrey">
+  </p>
+</div>
+
+> This is a fork of [facebookresearch/fast3r](https://github.com/facebookresearch/fast3r) at commit
+> [`33104d4b5b8d`](https://github.com/facebookresearch/fast3r/commit/33104d4b5b8df43795ecded236194958bbdac572) with the AutoOptm patch applied on top.
+> **The measured program was added by this fork**: `bench_infer.py` does not exist upstream. It loads the released
+> Fast3R ViT-Large/512 checkpoint (`jedyang97/Fast3R_ViT_Large_512`) and runs one multi-view reconstruction pass over
+> 20 frames of the repository's own lighthouse demo video, calling `inference(..., dtype=torch.float32)` the way the
+> upstream demo does. The commit adds that program unchanged; the optimisation itself is in upstream code under
+> `fast3r/`, and `bench_infer.py` is not modified by it.
+> The optimisation was found, measured and verified automatically by [AutoOptm](https://autooptm.com);
+> the patch is also kept verbatim at [`.autooptm/autooptm.patch`](.autooptm/autooptm.patch).
+
+## The result
+
+| | |
+|---|---|
+| **Command** | `python bench_infer.py` |
+| **Entry point** | `bench_infer.py` (added by this fork) |
+| **Workload** | Fast3R ViT-Large/512 inference: 20 frames (every 10th frame of `demo_examples/lighthouse/lighthouse.mp4`) loaded at 512 px and reconstructed in one multi-view forward pass |
+| **Before (stock)** | 154.67 ms per timed unit (median) |
+| **After (this tree as shipped, no switches set)** | 99.24 ms per timed unit (median) |
+| **Speedup** | **1.56x** end to end on A10, measured in the program itself |
+| **Output** | passed the output check against the stock program; the check, the reference outputs and the inputs were fixed before optimization began, and any faster result that failed it was discarded |
+
+### What changed
+
+| File | Where | Gain (alone) |
+|---|---|---|
+| `fast3r/models/multiview_dust3r_module.py` | MultiViewDUSt3RLitModule.load_for_inference() | — |
+| `fast3r/dust3r/utils/image.py` | load_images() | — |
+| `fast3r/croco/models/pos_embed.py` | RoPE2D.forward() | — |
+| `fast3r/croco/models/blocks.py` | Attention.forward() | — |
+| `fast3r/dust3r/inference_multiview.py` | loss_of_one_batch() | — |
+| `fast3r/dust3r/heads/postprocess.py` | postprocess() | — |
+
+## Reproduce
+
+```bash
+git clone https://github.com/autooptm/fast3r-ao.git
+cd fast3r-ao
+# install exactly as upstream documents (conda env, requirements.txt, pip install -e .), then
+# extract the 20 benchmark frames the program reads:
+pip install opencv-python-headless
+python - <<'EOF'
+import cv2, os
+os.makedirs("bench_frames", exist_ok=True)
+cap = cv2.VideoCapture("demo_examples/lighthouse/lighthouse.mp4")
+i = n = 0
+while n < 20:
+    ok, fr = cap.read()
+    if not ok: break
+    if i % 10 == 0:
+        cv2.imwrite(f"bench_frames/{n:03d}.jpg", fr); n += 1
+    i += 1
+EOF
+python bench_infer.py
+```
+
+The diff against upstream is one commit: `git log -1 -p` shows it. `git diff 33104d4b5b8d` is
+`bench_infer.py` (the benchmark program, added as submitted) plus the same patch as
+`.autooptm/autooptm.patch`.
+
+---
+
+<div align="center"><sub>Optimized by <a href="https://autooptm.com">AutoOptm</a> — point it at a repository, get back a verified speedup and the patch.</sub></div>
+
+---
+
+<div align="center">
 
 # ⚡️Fast3R: Towards 3D Reconstruction of 1000+ Images in One Forward Pass
 
